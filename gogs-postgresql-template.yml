@@ -1,45 +1,52 @@
-apiVersion: v1
 kind: Template
-labels:
-  template: gogs
-  version: 0.9.13
+apiVersion: v1
 metadata:
   annotations:
     description: The Gogs git server (https://gogs.io/)
-    tags: gogs,go,golang
-    version: 0.9.13
+    tags: instant-app,gogs,go,golang
   name: gogs
 objects:
-- apiVersion: v1
-  kind: Service
+- kind: ServiceAccount
+  apiVersion: v1
+  metadata:
+    creationTimestamp: null
+    labels:
+      app: ${APPLICATION_NAME}
+    name: ${APPLICATION_NAME}
+- kind: Service
+  apiVersion: v1
   metadata:
     annotations:
       description: Exposes the database server
-    name: ${DATABASE_SERVICE_NAME}
+    name: ${APPLICATION_NAME}-postgresql
+    labels:
+      app: ${APPLICATION_NAME}
   spec:
     ports:
     - name: postgresql
       port: 5432
       targetPort: 5432
     selector:
-      name: ${DATABASE_SERVICE_NAME}
-- apiVersion: v1
-  kind: DeploymentConfig
+      name: ${APPLICATION_NAME}-postgresql
+- kind: DeploymentConfig
+  apiVersion: v1
   metadata:
     annotations:
       description: Defines how to deploy the database
-    name: ${DATABASE_SERVICE_NAME}
+    name: ${APPLICATION_NAME}-postgresql
+    labels:
+      app: ${APPLICATION_NAME}
   spec:
     replicas: 1
     selector:
-      name: ${DATABASE_SERVICE_NAME}
+      name: ${APPLICATION_NAME}-postgresql
     strategy:
       type: Recreate
     template:
       metadata:
         labels:
-          name: ${DATABASE_SERVICE_NAME}
-        name: ${DATABASE_SERVICE_NAME}
+          name: ${APPLICATION_NAME}-postgresql
+        name: ${APPLICATION_NAME}-postgresql
       spec:
         serviceAccountName: ${APPLICATION_NAME}
         containers:
@@ -51,9 +58,9 @@ objects:
           - name: POSTGRESQL_DATABASE
             value: ${DATABASE_NAME}
           - name: POSTGRESQL_MAX_CONNECTIONS
-            value: ${POSTGRESQL_MAX_CONNECTIONS}
+            value: ${DATABASE_MAX_CONNECTIONS}
           - name: POSTGRESQL_SHARED_BUFFERS
-            value: ${POSTGRESQL_SHARED_BUFFERS}
+            value: ${DATABASE_SHARED_BUFFERS}
           - name: POSTGRESQL_ADMIN_PASSWORD
             value: ${DATABASE_ADMIN_PASSWORD}
           image: ' '
@@ -62,15 +69,31 @@ objects:
             tcpSocket:
               port: 5432
             timeoutSeconds: 1
+            failureThreshold: 10
+            periodSeconds: 20
           name: postgresql
           ports:
           - containerPort: 5432
+          readinessProbe:
+            exec:
+              command:
+              - /bin/sh
+              - -i
+              - -c
+              - psql -h 127.0.0.1 -U ${POSTGRESQL_USER} -q -d ${POSTGRESQL_DATABASE} -c 'SELECT 1'
+            initialDelaySeconds: 30
+            timeoutSeconds: 1
+            failureThreshold: 10
+          resources:
+            limits:
+              memory: 512Mi
           volumeMounts:
           - mountPath: /var/lib/pgsql/data
             name: gogs-postgres-data
         volumes:
         - name: gogs-postgres-data
-          emptyDir: {} 
+          persistentVolumeClaim:
+            claimName: gogs-postgres-data
     triggers:
     - imageChangeParams:
         automatic: true
@@ -78,18 +101,19 @@ objects:
         - postgresql
         from:
           kind: ImageStreamTag
-          name: postgresql:9.4
+          name: postgresql:${DATABASE_VERSION}
           namespace: openshift
       type: ImageChange
     - type: ConfigChange
-- apiVersion: v1
-  kind: Service
+- kind: Service
+  apiVersion: v1
   metadata:
     annotations:
       description: The Gogs server's http port
+      service.alpha.openshift.io/dependencies: '[{"name":"${APPLICATION_NAME}-postgresql","namespace":"","kind":"Service"}]'
     labels:
       app: ${APPLICATION_NAME}
-    name: ${APPLICATION_NAME}-service
+    name: ${APPLICATION_NAME}
   spec:
     ports:
     - name: 3000-tcp
@@ -103,9 +127,9 @@ objects:
     type: ClusterIP
   status:
     loadBalancer: {}
-- apiVersion: v1
+- kind: Route
+  apiVersion: v1
   id: ${APPLICATION_NAME}-http
-  kind: Route
   metadata:
     annotations:
       description: Route for application's http service.
@@ -113,11 +137,11 @@ objects:
       app: ${APPLICATION_NAME}
     name: ${APPLICATION_NAME}
   spec:
-    host: ${HOSTNAME_HTTP}
+    host: ${HOSTNAME}
     to:
-      name: ${APPLICATION_NAME}-service
-- apiVersion: v1
-  kind: DeploymentConfig
+      name: ${APPLICATION_NAME}
+- kind: DeploymentConfig
+  apiVersion: v1
   metadata:
     labels:
       app: ${APPLICATION_NAME}
@@ -154,25 +178,44 @@ objects:
           resources: {}
           terminationMessagePath: /dev/termination-log
           volumeMounts:
-          - mountPath: /var/tmp
-            name: gogs-data         
+          - name: gogs-data
+            mountPath: /opt/gogs/data
+          - name: gogs-config
+            mountPath: /etc/gogs/conf
+          readinessProbe:
+              httpGet:
+                path: /
+                port: 3000
+                scheme: HTTP
+              initialDelaySeconds: 40
+              timeoutSeconds: 1
+              periodSeconds: 20
+              successThreshold: 1
+              failureThreshold: 10
+          livenessProbe:
+              httpGet:
+                path: /
+                port: 3000
+                scheme: HTTP
+              initialDelaySeconds: 40
+              timeoutSeconds: 1
+              periodSeconds: 10
+              successThreshold: 1
+              failureThreshold: 10
         dnsPolicy: ClusterFirst
         restartPolicy: Always
         securityContext: {}
         terminationGracePeriodSeconds: 30
         volumes:
         - name: gogs-data
-          emptyDir: {}
-        livenessProbe:
-            httpGet:
-              path: /
-              port: 3000
-              scheme: HTTP
-            initialDelaySeconds: 3
-            timeoutSeconds: 1
-            periodSeconds: 10
-            successThreshold: 1
-            failureThreshold: 3        
+          persistentVolumeClaim:
+            claimName: gogs-data
+        - name: gogs-config
+          configMap:
+            name: gogs-config
+            items:
+              - key: app.ini
+                path: app.ini
     test: false
     triggers:
     - type: ConfigChange
@@ -182,80 +225,105 @@ objects:
         - ${APPLICATION_NAME}
         from:
           kind: ImageStreamTag
-          name: ${APPLICATION_NAME}:latest
+          name: ${APPLICATION_NAME}:${GOGS_VERSION}
       type: ImageChange
-- apiVersion: v1
-  kind: ImageStream
+- kind: ImageStream
+  apiVersion: v1
   metadata:
     labels:
       app: ${APPLICATION_NAME}
     name: ${APPLICATION_NAME}
   spec:
     tags:
-    - annotations:
-        description: The Gogs git server docker image
-        tags: gogs,go,golang
-        version: "latest"
+    - name: "${GOGS_VERSION}"
       from:
         kind: DockerImage
-        name: openshiftdemos/gogs:latest
+        name: docker.io/openshiftdemos/gogs:${GOGS_VERSION}
       importPolicy: {}
-      name: "latest"
-- apiVersion: v1
-  kind: PersistentVolumeClaim
+      annotations:
+        description: The Gogs git server docker image
+        tags: gogs,go,golang
+        version: "${GOGS_VERSION}"
+- kind: PersistentVolumeClaim
+  apiVersion: v1
   metadata:
     name: gogs-data
+    labels:
+      app: ${APPLICATION_NAME}
   spec:
     accessModes:
       - ReadWriteOnce
     resources:
       requests:
-        storage: ${VOLUME_CAPACITY}
-      volumeName: "gogs-pv"
-- apiVersion: v1
-  kind: ServiceAccount
-  metadata:
-    creationTimestamp: null
-    labels:
-      template: ${APPLICATION_NAME}
-    name: ${APPLICATION_NAME}
-- apiVersion: v1
-  kind: PersistentVolumeClaim
+        storage: ${GOGS_VOLUME_CAPACITY}
+- kind: PersistentVolumeClaim
+  apiVersion: v1
   metadata:
     name: gogs-postgres-data
+    labels:
+      app: ${APPLICATION_NAME}
   spec:
     accessModes:
       - ReadWriteOnce
     resources:
       requests:
         storage: ${DB_VOLUME_CAPACITY}
-      volumeName: "postgresql-pv"
+- kind: ConfigMap
+  apiVersion: v1
+  metadata:
+    name: gogs-config
+    labels:
+      app: ${APPLICATION_NAME}
+  data:
+    app.ini: |
+      RUN_MODE = prod
+      RUN_USER = gogs
+
+      [database]
+      DB_TYPE  = postgres
+      HOST     = ${APPLICATION_NAME}-postgresql:5432
+      NAME     = ${DATABASE_NAME}
+      USER     = ${DATABASE_USER}
+      PASSWD   = ${DATABASE_PASSWORD}
+
+      [repository]
+      ROOT = /opt/gogs/data/repositories
+
+      [server]
+      ROOT_URL=http://${HOSTNAME}
+      SSH_DOMAIN=${HOSTNAME}
+
+      [security]
+      INSTALL_LOCK = ${INSTALL_LOCK}
+
+      [service]
+      ENABLE_CAPTCHA = false
+
+      [webhook]
+      SKIP_TLS_VERIFY = ${SKIP_TLS_VERIFY}
 parameters:
 - description: The name for the application.
   name: APPLICATION_NAME
   required: true
   value: gogs
-- description: 'Custom hostname for http service route.  Leave blank for default hostname,
-    e.g.: <application-name>-<project>.<default-domain-suffix>'
-  name: HOSTNAME_HTTP
-- description: Volume space available for data, e.g. 512Mi, 2Gi
-  name: VOLUME_CAPACITY
+- description: 'Custom hostname for http service route.  Leave blank for default hostname, e.g.: <application-name>-<project>.<default-domain-suffix>'
+  name: HOSTNAME
   required: true
-  value: 5Gi
+- description: Volume space available for data, e.g. 512Mi, 2Gi
+  name: GOGS_VOLUME_CAPACITY
+  required: true
+  value: 1Gi
 - description: Volume space available for postregs data, e.g. 512Mi, 2Gi
   name: DB_VOLUME_CAPACITY
   required: true
-  value: 6Gi    
-- displayName: Database Service Name
-  name: DATABASE_SERVICE_NAME
-  value: postgresql
+  value: 1Gi
 - displayName: Database Username
   from: gogs
-  generate: expression
+  value: gogs
   name: DATABASE_USER
 - displayName: Database Password
   from: '[a-zA-Z0-9]{8}'
-  generate: expression
+  value: gogs
   name: DATABASE_PASSWORD
 - displayName: Database Name
   name: DATABASE_NAME
@@ -263,10 +331,26 @@ parameters:
 - displayName: Database Admin Password
   from: '[a-zA-Z0-9]{8}'
   generate: expression
-  name: DATABASE_ADMIN_PASSWORD  
+  name: DATABASE_ADMIN_PASSWORD
 - displayName: Maximum Database Connections
-  name: POSTGRESQL_MAX_CONNECTIONS
+  name: DATABASE_MAX_CONNECTIONS
   value: "100"
 - displayName: Shared Buffer Amount
-  name: POSTGRESQL_SHARED_BUFFERS
+  name: DATABASE_SHARED_BUFFERS
   value: 12MB
+- displayName: Database version (PostgreSQL)
+  name: DATABASE_VERSION
+  value: "9.5"
+- name: GOGS_VERSION
+  displayName: Gogs Version
+  description: 'Version of the Gogs container image to be used (check the available version https://hub.docker.com/r/openshiftdemos/gogs/tags)'
+  value: "0.9.97"
+  required: true
+- name: INSTALL_LOCK
+  displayName: Installation lock
+  description: 'If set to true, installation (/install) page will be disabled. Set to false if you want to run the installation wizard via web'
+  value: "true"
+- name: SKIP_TLS_VERIFY
+  displayName: Skip TLS verification on webhooks
+  description: Skip TLS verification on webhooks. Enable with caution!
+  value: "false"
